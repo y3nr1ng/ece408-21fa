@@ -29,6 +29,22 @@ void conv_forward_cpu(float *y, const float *x, const float *k, const int B, con
 #define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
   // Insert your CPU convolution kernel code here
+  for (int b = 0; b < B; b++) {
+    for (int m = 0; m < M; m++) {
+      for (int h = 0; h < H_out; h++) {
+        for (int w = 0; w < W_out; w++) {
+          y4d(b, m, h, w) = 0;
+          for (int c = 0; c < C; c++) {
+            for (int p = 0; p < K; p++) {
+              for (int q = 0; q < K; q++) {
+                y4d(b, m, h, w) += x4d(b, c, h + p, w + q) * k4d(m, c, p, q);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 
 #undef y4d
 #undef x4d
