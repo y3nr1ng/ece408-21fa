@@ -47,15 +47,11 @@ __global__ void conv_forward_kernel(float* y,
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
 
-  // TODO remove these stubs
-  (void)H_out;  // silence declared but never referenced warning. remove this
-                // line when you start working
-  (void)W_out;  // silence declared but never referenced warning. remove this
-                // line when you start working
-
-  // We have some nice #defs for you below to simplify indexing. Feel free to
-  // use them, or create your own. An example use of these macros: float a =
-  // y4d(0,0,0,0) y4d(0,0,0,0) = a
+  const int h = blockIdx.y * blockDim.y + threadIdx.y;
+  const int w = blockIdx.x * blockDim.x + threadIdx.x;
+  if ((h >= H_out) && (w >= W_out)) {
+    return;
+  }
 
 #define y4d(i3, i2, i1, i0) \
   y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
@@ -64,8 +60,19 @@ __global__ void conv_forward_kernel(float* y,
 #define k4d(i3, i2, i1, i0) \
   k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
-  // Insert your GPU convolution kernel code here
-  // TODO update kernel contents
+  // Niave GPU convolution kernel code
+  for (int b = 0; b < B; b++) {
+    for (int m = 0; m < M; m++) {
+      y4d(b, m, h, w) = 0;
+      for (int c = 0; c < C; c++) {
+        for (int p = 0; p < K; p++) {
+          for (int q = 0; q < K; q++) {
+            y4d(b, m, h, w) += x4d(b, c, h + p, w + q) * k4d(m, c, p, q);
+          }
+        }
+      }
+    }
+  }
 
 #undef y4d
 #undef x4d
@@ -98,9 +105,9 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
 
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
-  const size_t bytes_y = (M * H_out * W_out) * sizeof(float);
-  const size_t bytes_x = (C * H * W) * sizeof(float);
-  const size_t bytes_k = (C * K * K) * sizeof(float);
+  const size_t bytes_y = (B * M * H_out * W_out) * sizeof(float);
+  const size_t bytes_x = (B * C * H * W) * sizeof(float);
+  const size_t bytes_k = (M * C * K * K) * sizeof(float);
 
   // Allocate memory
   cudaErrChk(cudaMalloc(device_y_ptr, bytes_y));
@@ -108,9 +115,9 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
   cudaErrChk(cudaMalloc(device_k_ptr, bytes_k));
 
   // Copy over the relevant data structures to the GPU
-  cudaErrChk(cudaMemcpy(device_y_ptr, host_y, bytes_y, cudaMemcpyHostToDevice));
-  cudaErrChk(cudaMemcpy(device_x_ptr, host_x, bytes_x, cudaMemcpyHostToDevice));
-  cudaErrChk(cudaMemcpy(device_k_ptr, host_k, bytes_k, cudaMemcpyHostToDevice));
+  cudaErrChk(cudaMemcpy(*device_y_ptr, host_y, bytes_y, cudaMemcpyHostToDevice));
+  cudaErrChk(cudaMemcpy(*device_x_ptr, host_x, bytes_x, cudaMemcpyHostToDevice));
+  cudaErrChk(cudaMemcpy(*device_k_ptr, host_k, bytes_k, cudaMemcpyHostToDevice));
 }
 
 __host__ void GPUInterface::conv_forward_gpu(float* device_y,
@@ -123,9 +130,10 @@ __host__ void GPUInterface::conv_forward_gpu(float* device_y,
                                              const int W,
                                              const int K) {
   // Set the kernel dimensions and call the kernel
-  // TODO update dimension information
-  dim3 dim_block(1);
-  dim3 dim_grid(1);
+  const int H_out = H - K + 1;
+  const int W_out = W - K + 1;
+  dim3 dim_block(32, 32);
+  dim3 dim_grid(ceil((float)W_out / 32), ceil((float)H_out / 32));
 
   conv_forward_kernel<<<dim_block, dim_grid>>>(device_y, device_x, device_k, B,
                                                M, C, H, W, K);
