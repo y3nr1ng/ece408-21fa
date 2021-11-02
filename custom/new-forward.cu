@@ -10,8 +10,8 @@ inline void cudaAssert(cudaError_t error,
                        int line,
                        bool abort = true) {
   if (error != cudaSuccess) {
-    std::cerr << "CUDA error: " << cudaGetErrorString(error) << file << line
-              << std::endl;
+    std::cerr << "CUDA error: " << cudaGetErrorString(error) << ' ' << file
+              << ':' << line << std::endl;
     if (abort) {
       exit(error);
     }
@@ -60,17 +60,18 @@ __global__ void conv_forward_kernel(float* y,
 #define k4d(i3, i2, i1, i0) \
   k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
-  // Niave GPU convolution kernel code
+  // Naive GPU convolution kernel code
   for (int b = 0; b < B; b++) {
     for (int m = 0; m < M; m++) {
-      y4d(b, m, h, w) = 0;
+      float sum = 0;
       for (int c = 0; c < C; c++) {
         for (int p = 0; p < K; p++) {
           for (int q = 0; q < K; q++) {
-            y4d(b, m, h, w) += x4d(b, c, h + p, w + q) * k4d(m, c, p, q);
+            sum += x4d(b, c, h + p, w + q) * k4d(m, c, p, q);
           }
         }
       }
+      y4d(b, m, h, w) = sum;
     }
   }
 
@@ -115,9 +116,12 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
   cudaErrChk(cudaMalloc(device_k_ptr, bytes_k));
 
   // Copy over the relevant data structures to the GPU
-  cudaErrChk(cudaMemcpy(*device_y_ptr, host_y, bytes_y, cudaMemcpyHostToDevice));
-  cudaErrChk(cudaMemcpy(*device_x_ptr, host_x, bytes_x, cudaMemcpyHostToDevice));
-  cudaErrChk(cudaMemcpy(*device_k_ptr, host_k, bytes_k, cudaMemcpyHostToDevice));
+  cudaErrChk(
+      cudaMemcpy(*device_y_ptr, host_y, bytes_y, cudaMemcpyHostToDevice));
+  cudaErrChk(
+      cudaMemcpy(*device_x_ptr, host_x, bytes_x, cudaMemcpyHostToDevice));
+  cudaErrChk(
+      cudaMemcpy(*device_k_ptr, host_k, bytes_k, cudaMemcpyHostToDevice));
 }
 
 __host__ void GPUInterface::conv_forward_gpu(float* device_y,
