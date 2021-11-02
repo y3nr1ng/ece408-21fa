@@ -49,7 +49,7 @@ __global__ void conv_forward_kernel(float* y,
 
   const int h = blockIdx.y * blockDim.y + threadIdx.y;
   const int w = blockIdx.x * blockDim.x + threadIdx.x;
-  if ((h >= H_out) && (w >= W_out)) {
+  if ((h >= H_out) || (w >= W_out)) {
     return;
   }
 
