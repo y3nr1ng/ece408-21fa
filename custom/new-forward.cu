@@ -92,18 +92,6 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
                                                     const int H,
                                                     const int W,
                                                     const int K) {
-  /*
-  y - output
-  x - input
-  k - kernel
-  B - batch_size (number of images in x)
-  M - number of output feature maps
-  C - number of input feature maps
-  H - input height dimension
-  W - input width dimension
-  K - kernel height and width (K x K)
-  */
-
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
   const size_t bytes_y = (B * M * H_out * W_out) * sizeof(float);
@@ -133,12 +121,13 @@ __host__ void GPUInterface::conv_forward_gpu(float* device_y,
                                              const int H,
                                              const int W,
                                              const int K) {
-  // Set the kernel dimensions and call the kernel
+  // Set the kernel dimensions
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
   dim3 dim_block(32, 32);
   dim3 dim_grid(ceil((float)W_out / 32), ceil((float)H_out / 32));
 
+  // Call the kernel
   conv_forward_kernel<<<dim_block, dim_grid>>>(device_y, device_x, device_k, B,
                                                M, C, H, W, K);
   cudaErrChk(cudaDeviceSynchronize());
@@ -154,18 +143,6 @@ __host__ void GPUInterface::conv_forward_gpu_epilog(float* host_y,
                                                     const int H,
                                                     const int W,
                                                     const int K) {
-  /*
-  y - output
-  x - input
-  k - kernel
-  B - batch_size (number of images in x)
-  M - number of output feature maps
-  C - number of input feature maps
-  H - input height dimension
-  W - input width dimension
-  K - kernel height and width (K x K)
-  */
-
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
   const size_t bytes_y = (B * M * H_out * W_out) * sizeof(float);
