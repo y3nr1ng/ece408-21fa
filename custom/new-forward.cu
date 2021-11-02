@@ -2,6 +2,22 @@
 #include <iostream>
 #include "gpu-new-forward.h"
 
+#define cudaErrChk(stmt) \
+  { cudaAssert((stmt), __FILE__, __LINE__); }
+
+inline void cudaAssert(cudaError_t error,
+                       const char* file,
+                       int line,
+                       bool abort = true) {
+  if (error != cudaSuccess) {
+    std::cerr << "CUDA error: " << cudaGetErrorString(error) << file << line
+              << std::endl;
+    if (abort) {
+      exit(error);
+    }
+  }
+}
+
 __global__ void conv_forward_kernel(float* y,
                                     const float* x,
                                     const float* k,
@@ -65,18 +81,33 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
                                                     const int H,
                                                     const int W,
                                                     const int K) {
-  // Allocate memory and copy over the relevant data structures to the GPU
+  /*
+  y - output
+  x - input
+  k - kernel
+  B - batch_size (number of images in x)
+  M - number of output feature maps
+  C - number of input feature maps
+  H - input height dimension
+  W - input width dimension
+  K - kernel height and width (K x K)
+  */
 
-  // We pass double pointers for you to initialize the relevant device pointers,
-  //  which are passed to the other two functions.
+  const int H_out = H - K + 1;
+  const int W_out = W - K + 1;
+  const size_t bytes_y = (M * H_out * W_out) * sizeof(float);
+  const size_t bytes_x = (C * H * W) * sizeof(float);
+  const size_t bytes_k = (C * K * K) * sizeof(float);
 
-  // Useful snippet for error checking
-  // cudaError_t error = cudaGetLastError();
-  // if(error != cudaSuccess)
-  // {
-  //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
-  //     exit(-1);
-  // }
+  // Allocate memory
+  cudaErrChk(cudaMalloc(device_y_ptr, bytes_y));
+  cudaErrChk(cudaMalloc(device_x_ptr, bytes_x));
+  cudaErrChk(cudaMalloc(device_k_ptr, bytes_k));
+
+  // Copy over the relevant data structures to the GPU
+  cudaErrChk(cudaMemcpy(device_y_ptr, host_y, bytes_y, cudaMemcpyHostToDevice));
+  cudaErrChk(cudaMemcpy(device_x_ptr, host_x, bytes_x, cudaMemcpyHostToDevice));
+  cudaErrChk(cudaMemcpy(device_k_ptr, host_k, bytes_k, cudaMemcpyHostToDevice));
 }
 
 __host__ void GPUInterface::conv_forward_gpu(float* device_y,
@@ -101,9 +132,29 @@ __host__ void GPUInterface::conv_forward_gpu_epilog(float* host_y,
                                                     const int H,
                                                     const int W,
                                                     const int K) {
+  /*
+  y - output
+  x - input
+  k - kernel
+  B - batch_size (number of images in x)
+  M - number of output feature maps
+  C - number of input feature maps
+  H - input height dimension
+  W - input width dimension
+  K - kernel height and width (K x K)
+  */
+
+  const int H_out = H - K + 1;
+  const int W_out = W - K + 1;
+  const size_t bytes_y = (M * H_out * W_out) * sizeof(float);
+
   // Copy the output back to host
+  cudaErrChk(cudaMemcpy(host_y, device_y, bytes_y, cudaMemcpyDeviceToHost));
 
   // Free device memory
+  cudaErrChk(cudaFree(device_y));
+  cudaErrChk(cudaFree(device_x));
+  cudaErrChk(cudaFree(device_k));
 }
 
 __host__ void GPUInterface::get_device_properties() {
