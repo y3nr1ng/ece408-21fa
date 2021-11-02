@@ -46,6 +46,8 @@ __global__ void conv_forward_kernel(float* y,
 
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
+
+  // TODO remove these stubs
   (void)H_out;  // silence declared but never referenced warning. remove this
                 // line when you start working
   (void)W_out;  // silence declared but never referenced warning. remove this
@@ -63,6 +65,7 @@ __global__ void conv_forward_kernel(float* y,
   k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
   // Insert your GPU convolution kernel code here
+  // TODO update kernel contents
 
 #undef y4d
 #undef x4d
@@ -120,6 +123,13 @@ __host__ void GPUInterface::conv_forward_gpu(float* device_y,
                                              const int W,
                                              const int K) {
   // Set the kernel dimensions and call the kernel
+  // TODO update dimension information
+  dim3 dim_block(1);
+  dim3 dim_grid(1);
+
+  conv_forward_kernel<<<dim_block, dim_grid>>>(device_y, device_x, device_k, B,
+                                               M, C, H, W, K);
+  cudaErrChk(cudaDeviceSynchronize());
 }
 
 __host__ void GPUInterface::conv_forward_gpu_epilog(float* host_y,
