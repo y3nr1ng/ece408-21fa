@@ -164,7 +164,7 @@ __host__ void GPUInterface::conv_forward_gpu_epilog(float* host_y,
 
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
-  const size_t bytes_y = (M * H_out * W_out) * sizeof(float);
+  const size_t bytes_y = (B * M * H_out * W_out) * sizeof(float);
 
   // Copy the output back to host
   cudaErrChk(cudaMemcpy(host_y, device_y, bytes_y, cudaMemcpyDeviceToHost));
