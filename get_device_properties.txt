@@ -1,0 +1,9 @@
+Device 0 name: TITAN V
+Computational capabilities: 7.0
+Max Global memory size: 12651462656
+Max Constant memory size: 65536
+Max Shared memory size per block: 49152
+Max threads per block: 1024
+Max block dimensions: 1024 x, 1024 y, 64 z
+Max grid dimensions: 2147483647 x, 65535 y, 65535 z
+Warp Size: 32

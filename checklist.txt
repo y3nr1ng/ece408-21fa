@@ -1,0 +1,26 @@
+(1 points)
+- [ ] Weight matrix (kernel values) in constant memory
+- [ ] Sweeping various parameters to find best values (block sizes, amount of thread coarsening)
+- [ ] Multiple kernel implementations for different layer sizes
+
+(2 points)
+- [ ] Tiled shared memory convolution
+- [ ] Kernel fusion for unrolling and matrix-multiplication (requires "Shared memory matrix multiplication and input matrix unrolling")
+- [ ] Input channel reduction: atomics
+
+(3 points)
+- [ ] Shared memory matrix multiplication and input matrix unrolling
+- [ ] Tuning with restrict and loop unrolling (considered as one optimization only if you do both)
+- [ ] Input channel reduction: tree
+
+(4 points)
+- [ ] Fixed point (FP16) arithmetic. (note this can modify model accuracy slightly)
+- [ ] Using Streams to overlap computation with data transfer
+
+(5 points)
+- [ ] An advanced matrix multiplication algorithm (register-tiled, for example)
+- [ ] Using Tensor Cores to speed up matrix multiplication
+
+(8 points)
+- [ ] Overlap-Add method for FFT-based convolution (note this is very hard, and may not yeild a large performace increase due to mask size)
+

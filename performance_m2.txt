@@ -1,0 +1,58 @@
+Op-1
+(B=100, M=4, C=1, H=86, W=86, K=7)
+
+Op-2
+(B=100, M=16, C=4, H=40, W=40, K=7)
+
+  B - batch_size (number of images in input)
+  M - number of output feature maps
+  C - number of input feature maps
+  H - input height dimension
+  W - input width dimension
+  K - kernel height and width (K x K)
+
+
+=== (8, 8) ===
+Test batch size: 10000
+Loading fashion-mnist data...Done
+Loading model...Done
+Conv-GPU==
+Layer Time: 938.311 ms
+Op Time: 100.591 ms
+Conv-GPU==
+Layer Time: 1982.54 ms
+Op Time: 1374.2 ms
+
+Test Accuracy: 0.8714
+
+
+=== (16, 16) ===
+Test batch size: 10000
+Loading fashion-mnist data...Done
+Loading model...Done
+Conv-GPU==
+Layer Time: 961.189 ms
+Op Time: 110.412 ms
+Conv-GPU==
+Layer Time: 2089.71 ms
+Op Time: 1468.85 ms
+
+Test Accuracy: 0.8714
+
+
+=== (32, 32) ===
+Test batch size: 10000
+Loading fashion-mnist data...Done
+Loading model...Done
+Conv-GPU==
+Layer Time: 1027.78 ms
+Op Time: 201.519 ms
+Conv-GPU==
+Layer Time: 3517.64 ms
+Op Time: 2915.48 ms
+
+Test Accuracy: 0.8714
+
+
+=== (128, 128) ===
+
