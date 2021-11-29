@@ -83,20 +83,20 @@ __global__ void im2col(float* xc,
   hi/wi - input height/width
   hk/wk - convolution loop height/width
   */
-#define xc5d(i_ho, i_wo, i_c, i_hk, i_wk)    \
-  xc[b * (H_out * W_out * C * k * K) +       \
-     (i_ho * (W_out) + i_wo) * (C * K * K) + \
-     i_c * (K * K) + i_hk * (K) + i_wk]
-#define t3d(i_c, i_ph, i_pw)                              \
-  tile[tb * (C * PADDED_TILE_WIDTH * PADDED_TILE_WIDTH) + \
-       i_c * (PADDED_TILE_WIDTH * PADDED_TILE_WIDTH) +    \
-       i_ph * (PADDED_TILE_WIDTH) +                       \
-       i_pw]
+#define xc5d(i_ho, i_wo, i_c, i_hk, i_wk)        \
+  xc[(b) * (H_out * W_out * C * K * K) +         \
+     ((i_ho) * (W_out) + (i_wo)) * (C * K * K) + \
+     (i_c) * (K * K) + (i_hk) * (K) + (i_wk)]
+#define t3d(i_c, i_ph, i_pw)                                \
+  tile[(tb) * (C * PADDED_TILE_WIDTH * PADDED_TILE_WIDTH) + \
+       (i_c) * (PADDED_TILE_WIDTH * PADDED_TILE_WIDTH) +    \
+       (i_ph) * (PADDED_TILE_WIDTH) +                       \
+       (i_pw)]
 #define x3d(i_c, i_hi, i_wi) \
-  x[b * (C * H * W) +        \
-    i_c * (H * W) +          \
-    i_hi * (W) +             \
-    i_wi]
+  x[(b) * (C * H * W) +      \
+    (i_c) * (H * W) +        \
+    (i_hi) * (W) +           \
+    (i_wi)]
 
   // Alias for block/thread index
   const int bx = blockIdx.x, by = blockIdx.y;
@@ -148,7 +148,6 @@ __global__ void im2col(float* xc,
 #undef x3d
 }
 
-// TODO get back to work from here
 __global__ void matrix_multiply(float* y,
                                 const float* xc,
                                 const int B,
@@ -157,87 +156,94 @@ __global__ void matrix_multiply(float* y,
                                 const int H,
                                 const int W,
                                 const int K) {
-  extern __shared__ float sub_tiles[];
+  extern __shared__ float tile[];
 
-#define y2d(i1, i0) \
-  y[b * (M * H_out * W_out) + m * (H_out * W_out) + (i1) * (W_out) + i0]
-#define xc5d(i_ho, i_wo, i_c, i_hk, i_wk)    \
-  xc[b * (H_out * W_out * C * k * K) +       \
-     (i_ho * (W_out) + i_wo) * (C * K * K) + \
-     i_c * (K * K) + i_hk * (K) + i_wk]
+  /*
+   y.shape = (B, M, H_out, W_out)
+  xc.shape = (H_out * W_out, C * K * K) = (H_out, W_out, C * K * K)
+   t.shape = (b, 0/1, H_out, W_out, C, K, K)
+   k.shape = (M, C * K * K)
+  */
+#define y2d(i_m, i_hw)          \
+  y[(b) * (M * H_out * W_out) + \
+    (i_m) * (H_out * W_out) +   \
+    (i_hw)]
+#define xc2d(i_hw, i_ckk)                \
+  xc[(b) * (H_out * W_out * C * K * K) + \
+     (i_hw) * (C * K * K) +              \
+     (i_ckk)]
+#define t2d(i, i_hw, i_ckk)                   \
+  tile[(tb) * (2 * TILE_WIDTH * TILE_WIDTH) + \
+       (i) * (TILE_WIDTH * TILE_WIDTH) +      \
+       (i_hw) * (TILE_WIDTH) +                \
+       (i_ckk)]
+#define k2d(i_m, i_ckk)        \
+  kernel[(i_m) * (C * K * K) + \
+         (i_ckk)]
 
-  // original im2col implementation
-#define xc5d(i_ho, i_wo, i_c, i_hk, i_wk)    \
-  xc[b * (H_out * W_out * C * k * K) +       \
-     (i_ho * (W_out) + i_wo) * (C * K * K) + \
-     i_c * (K * K) + i_hk * (K) + i_wk]
-#define t3d(i_c, i_ph, i_pw)                              \
-  tile[tb * (C * PADDED_TILE_WIDTH * PADDED_TILE_WIDTH) + \
-       i_c * (PADDED_TILE_WIDTH * PADDED_TILE_WIDTH) +    \
-       i_ph * (PADDED_TILE_WIDTH) +                       \
-       i_pw]
-#define x3d(i_c, i_hi, i_wi) \
-  x[b * (C * H * W) +        \
-    i_c * (H * W) +          \
-    i_hi * (W) +             \
-    i_wi]
+#define t2d_xc(i_hw, i_ckk) \
+  t2d(0, i_hw, i_ckk)
+#define t2d_kt(i_m, i_ckk) \
+  t2d(1, i_m, i_ckk)
 
-// original stream implementation
-#define t3d(i2, i1, i0)                                   \
-  tile[tb * (C * PADDED_TILE_WIDTH * PADDED_TILE_WIDTH) + \
-       (i2) * (PADDED_TILE_WIDTH * PADDED_TILE_WIDTH) +   \
-       (i1) * (PADDED_TILE_WIDTH) + i0]
-#define x3d(i2, i1, i0) \
-  x[b * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-#define k3d(i2, i1, i0) \
-  kernel[m * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
-}
+  const int H_out = H - K + 1;
+  const int W_out = W - K + 1;
 
-// Compute C = A * B
-__global__ void matrixMultiplyShared(
-    float* A,
-    float* B,
-    float* C,
-    int numARows,
-    int numAColumns,
-    int numBRows,
-    int numBColumns,
-    int numCRows,
-    int numCColumns) {
-  __shared__ float subTileA[TILE_WIDTH][TILE_WIDTH];
-  __shared__ float subTileB[TILE_WIDTH][TILE_WIDTH];
+  const int n_hw = H_out * W_out;
 
-  // abbreviations for thread index
-  int tx = threadIdx.x, ty = threadIdx.y;
+  // Alias for block/thread index
+  const int bx = blockIdx.x, by = blockIdx.y;
+  const int tx = threadIdx.x, ty = threadIdx.y;
+  // Alias for batch axis
+  const int tb = threadIdx.z;
+  const int b = blockIdx.z * blockDim.z + tb;
 
-  // identify the row and column of the C element to work on
-  int column = blockIdx.x * TILE_WIDTH + tx;
-  int row = blockIdx.y * TILE_WIDTH + ty;
+  // Identify the row/column of output element
+  // TODO currently, share TILE_WIDTH with im2col, Tensor needs TILE_WIDTH=16
+  int dst_hw = bx * TILE_WIDTH + tx;  // col
+  int dst_m = by * TILE_WIDTH + ty;   // row
 
-  // loop over A and B tiles required to compute C
-  // A_ik * B_kj = C_ij
-  float sum = 0;
-  int nTiles = (numAColumns + (TILE_WIDTH - 1)) / TILE_WIDTH;
-  for (int n = 0; n < nTiles; n++) {
-    if (n * TILE_WIDTH + tx < numAColumns) {
-      subTileA[ty][tx] = A[row * numAColumns + (n * TILE_WIDTH + tx)];
+  // Calculate number of subtiles
+  const int n_kernel = C * K * K;
+  const int n_tiles = (n_kernel + (TILE_WIDTH - 1)) / TILE_WIDTH;
+
+  int dst_ckk;
+
+  float acc = 0;
+  for (int n = 0; n < n_tiles; n++) {
+    // Save sub-tile of xc and kernel to smem
+    dst_ckk = n * TILE_WIDTH + ty;
+    if ((dst_hw < n_hw) && (dst_ckk < n_kernel)) {
+      t2d_xc(ty, tx) = xc2d(dst_hw, dst_ckk);
     } else {
-      subTileA[ty][tx] = 0.0;
+      t2d_xc(ty, tx) = 0.0;
     }
-    if (n * TILE_WIDTH + ty < numBRows) {
-      subTileB[ty][tx] = B[(n * TILE_WIDTH + ty) * numBColumns + column];
+    dst_ckk = n * TILE_WIDTH + tx;
+    if ((dst_m < M) && (dst_ckk < n_kernel)) {
+      t2d_kt(ty, tx) = k2d(dst_m, dst_ckk);
     } else {
-      subTileB[ty][tx] = 0.0;
+      t2d_kt(ty, tx) = 0.0;
     }
     __syncthreads();
+
+    // C_ij = A_ik * B_kj ===> C_ij^T = B_kj^T * A_ik^T
     for (int k = 0; k < TILE_WIDTH; k++) {
-      sum += subTileA[ty][k] * subTileB[k][tx];
+      acc += t2d_xc(k, tx) * t2d_kt(ty, k);
     }
     __syncthreads();
   }
-  if ((column < numCColumns) && (row < numCRows)) {
-    C[row * numCColumns + column] = sum;
+
+  if ((dst_m < M) && (dst_hw < n_hw)) {
+    y2d(dst_m, dst_hw) = acc;
   }
+
+#undef t2d_xc
+#undef t2d_kt
+
+#undef y2d
+#undef xc2d
+#undef t2d
+#undef k2d
 }
 
 __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
@@ -253,7 +259,6 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
                                                     const int W,
                                                     const int K) {
   std::cout << "*** constant mem + tiled + restrict/unroll + gemm ***" << std::endl;
-
   printf("(B=%d, M=%d, C=%d, H=%d, W=%d, K=%d)\n", B, M, C, H, W, K);
 
   // Buffer for im2col
@@ -262,6 +267,7 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
   // Estimat output dimension
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
+  printf("(H_out=%d, W_out=%d)\n", H_out, W_out);
 
   // Block size along the B (batch) dimension
   const int B_batch_size = 4;
@@ -272,6 +278,10 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
   const size_t bytes_k = (M * C * K * K) * sizeof(float);
   // Calculate needed bytes for unrolled input
   const size_t bytes_xc = (B * (H_out * W_out) * (C * K * K)) * sizeof(float);
+
+  const float ratio = (float)bytes_xc / bytes_x;
+  const float bytes_xc_mb = (float)bytes_xc / 1024 / 1024;
+  printf("*** memory increased %.2fx, %.2fMiB\n", ratio, bytes_xc_mb);
 
   // Allocate memory on device
   cudaErrChk(cudaMalloc(device_y_ptr, bytes_y));
@@ -306,7 +316,7 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
 }
 
 __host__ void GPUInterface::conv_forward_gpu(float* device_y,
-                                             const float* device_x,
+                                             const float* device_xc,
                                              const float* device_k,  // unused
                                              const int B,
                                              const int M,
@@ -323,24 +333,24 @@ __host__ void GPUInterface::conv_forward_gpu(float* device_y,
 
   // Calculate launch size
   dim3 block(TILE_WIDTH, TILE_WIDTH, B_batch_size);
-  dim3 grid(ceil((float)W_out / block.x),
-            ceil((float)H_out / block.y),
+  dim3 grid(ceil((float)H_out * W_out / block.x),
+            ceil((float)M / block.y),
             ceil((float)B / block.z));
   printf("grid=(x=%d, y=%d, z=%d), block=(x=%d, y=%d, z=%d)\n",
          grid.x, grid.y, grid.z, block.x, block.y, block.z);
 
   // Determine shared memory size
   size_t smem_size =
-      B_batch_size * C * PADDED_TILE_WIDTH * PADDED_TILE_WIDTH * sizeof(float);
+      B_batch_size * 2 * TILE_WIDTH * TILE_WIDTH * sizeof(float);
 
   // Call the kernel
-  conv_forward_kernel<<<grid, block, smem_size>>>(device_y, device_x, B, M, C, H, W, K);
+  matrix_multiply<<<grid, block, smem_size>>>(device_y, device_xc, B, M, C, H, W, K);
   cudaErrChk(cudaDeviceSynchronize());
 }
 
 __host__ void GPUInterface::conv_forward_gpu_epilog(float* host_y,
                                                     float* device_y,
-                                                    float* device_x,
+                                                    float* device_xc,
                                                     float* device_k,
                                                     const int B,
                                                     const int M,
@@ -357,7 +367,7 @@ __host__ void GPUInterface::conv_forward_gpu_epilog(float* host_y,
 
   // Free device memory
   cudaErrChk(cudaFree(device_y));
-  cudaErrChk(cudaFree(device_x));
+  cudaErrChk(cudaFree(device_xc));
 }
 
 __host__ void GPUInterface::get_device_properties() {
