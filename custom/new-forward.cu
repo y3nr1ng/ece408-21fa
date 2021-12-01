@@ -33,7 +33,7 @@ __constant__ float kernel[M_MAX * C_MAX * KERNEL_WIDTH * KERNEL_WIDTH];
 #define PADDED_TILE_WIDTH (TILE_WIDTH + KERNEL_WIDTH - 1)
 
 // Block size along the B (batch) dimension
-#define B_BATCH 1
+#define B_BATCH 4
 
 // Prepare input features as column matrix
 __global__ void im2col(float* xc,
@@ -252,11 +252,14 @@ __global__ void conv_as_gemm(float* y,
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
 
-  // Alias for block/thread index
-  const int tx = threadIdx.x, ty = threadIdx.y;
+  // Alias for height/width axis
+  const int t_hw = threadIdx.x;
+  // Alias for output channels
+  const int t_m = threadIdx.y;
+  const int m = blockIdx.y * TILE_WIDTH + t_m;
   // Alias for batch axis
-  const int tb = threadIdx.z;
-  const int b = blockIdx.z * blockDim.z + tb;
+  const int t_b = threadIdx.z;
+  const int b = blockIdx.z * B_BATCH + t_b;
 
   // Y = (H W) * (K^2 C)
   /*
@@ -272,27 +275,29 @@ __global__ void conv_as_gemm(float* y,
    t.shape = (b, 0/1, H_out, W_out, C, K, K)
    k.shape = (M, C * K * K)
   */
-#define y2d(i_m, i_hw)          \
+#define y1d(i_hw)               \
   y[(b) * (M * H_out * W_out) + \
-    (i_m) * (H_out * W_out) +   \
+    (m) * (H_out * W_out) +     \
     (i_hw)]
-#define xc2d(i_hw, i_ckk)                \
+#define xc2d(i_hw, i_ckk)                  \
   xc[(b) * (H_out * W_out * C * K * K) + \
-     (i_hw) * (C * K * K) +              \
+     (i_hw) * (C * K * K) +                \
      (i_ckk)]
+#define xc4d(i_hw, i_c, i_hk, i_wk) \
+  xc2d(i_hw, (i_c) * (K * K) + (i_hk) * (K) + (i_wk))
 #define x3d(i_c, i_hi, i_wi) \
   x[(b) * (C * H * W) +      \
     (i_c) * (H * W) +        \
     (i_hi) * (W) +           \
     (i_wi)]
 
-#define t2d(i, i_hw, i_ckk)                   \
-  tile[(tb) * (2 * TILE_WIDTH * TILE_WIDTH) + \
-       (i) * (TILE_WIDTH * TILE_WIDTH) +      \
-       (i_hw) * (TILE_WIDTH) +                \
+#define t2d(i, i_hw, i_ckk)                    \
+  tile[(t_b) * (2 * TILE_WIDTH * TILE_WIDTH) + \
+       (i) * (TILE_WIDTH * TILE_WIDTH) +       \
+       (i_hw) * (TILE_WIDTH) +                 \
        (i_ckk)]
-#define k2d(i_m, i_ckk)        \
-  kernel[(i_m) * (C * K * K) + \
+#define k1d(i_ckk)           \
+  kernel[(m) * (C * K * K) + \
          (i_ckk)]
 
 #define t2d_xc(i_hw, i_ckk) \
@@ -304,75 +309,78 @@ __global__ void conv_as_gemm(float* y,
 
   // Identify the row/column of output element
   // TODO currently, share TILE_WIDTH with im2col, Tensor needs TILE_WIDTH=16
-  const int dst_hw = blockIdx.x * TILE_WIDTH + tx;  // col
-  const int dst_m = blockIdx.y * TILE_WIDTH + ty;   // row
+  const int dst_hw = blockIdx.x * TILE_WIDTH + t_hw;
 
   // Calculate number of subtiles
   const int n_kernel = C * K * K;
   const int n_tiles = (n_kernel + (TILE_WIDTH - 1)) / TILE_WIDTH;
 
-  if (b < B) {
+  if ((b < B)) {
     int dst_ckk;
 
-    if (ty == 0) {
-      if (dst_hw < n_hw) {
-        // Calculate destination 3D index
-        const int dst_x = dst_hw % W_out;
-        const int dst_y = dst_hw / W_out;
+    /*
+    // Only first batch of threads need to fetch the data
+    if ((t_m == 0) && (dst_hw < n_hw)) {
+      // Calculate destination 3D index
+      const int dst_x = dst_hw % W_out;
+      const int dst_y = dst_hw / W_out;
 
-        // Unroll region of interest
-        for (int c = 0; c < C; c++) {
-          for (int p = 0; p < K; p++) {
-            for (int q = 0; q < K; q++) {
-              // Source 3D index
-              const int src_x = dst_x + q;
-              const int src_y = dst_y + p;
-
-              // Source unrolled index
-              dst_ckk = c * (K * K) + p * (K) + q;
-
-              if ((src_x < W) && (src_y < H)) {
-                xc2d(dst_hw, dst_ckk) = x3d(c, src_y, src_x);
-              } else {
-                printf("*** NO SHIT, OOB!\n");
-                xc2d(dst_hw, dst_ckk) = 0;  // this should never happen, block size is tuned
-              }
-            }
+      // Unroll region of interest
+      for (int c = 0; c < C; c++) {
+        for (int p = 0; p < K; p++) {
+          for (int q = 0; q < K; q++) {
+            // Source unrolled index
+            dst_ckk = c * (K * K) + p * (K) + q;
+            // 3D index in source array simply adds back the pad
+            xc4d(dst_hw, c, p, q) = x3d(c, dst_y + p, dst_x + q);
           }
         }
       }
     }
     __syncthreads();
+    */
 
     // Multiplication
     float acc = 0;
     for (int n = 0; n < n_tiles; n++) {
       // Save sub-tile of xc and kernel to smem
-      dst_ckk = n * TILE_WIDTH + ty;
+      dst_ckk = n * TILE_WIDTH + t_m;
       if ((dst_hw < n_hw) && (dst_ckk < n_kernel)) {
-        t2d_xc(ty, tx) = xc2d(dst_hw, dst_ckk);
+        //t2d_xc(t_m, t_hw) = xc2d(dst_hw, dst_ckk);
+
+        const int dst_x = dst_hw % W_out;
+        const int dst_y = dst_hw / W_out;
+
+        int tmp = dst_ckk;
+        const int q = tmp % K;
+        tmp /= K;
+        const int p = tmp % K;
+        const int c = tmp / K;
+
+        t2d_xc(t_m, t_hw) = x3d(c, dst_y + p, dst_x + q);
       } else {
-        t2d_xc(ty, tx) = 0.0;
+        t2d_xc(t_m, t_hw) = 0.0;
       }
-      dst_ckk = n * TILE_WIDTH + tx;
-      if ((dst_m < M) && (dst_ckk < n_kernel)) {
-        t2d_kt(ty, tx) = k2d(dst_m, dst_ckk);
+      dst_ckk = n * TILE_WIDTH + t_hw;
+      if ((m < M) && (dst_ckk < n_kernel)) {
+        t2d_kt(t_m, t_hw) = k1d(dst_ckk);
       } else {
-        t2d_kt(ty, tx) = 0.0;
+        t2d_kt(t_m, t_hw) = 0.0;
       }
       __syncthreads();
 
       // C_ij = A_ik * B_kj ===> C_ij^T = B_kj^T * A_ik^T
       for (int k = 0; k < TILE_WIDTH; k++) {
-        acc += t2d_kt(ty, k) * t2d_xc(k, tx);
+        acc += t2d_kt(t_m, k) * t2d_xc(k, t_hw);
       }
       __syncthreads();
     }
 
-    if ((dst_m < M) && (dst_hw < n_hw)) {
-      y2d(dst_m, dst_hw) = acc;
+    if ((m < M) && (dst_hw < n_hw)) {
+      y1d(dst_hw) = acc;
     }
   }
+
 #undef t2d_xc
 #undef t2d_kt
 
