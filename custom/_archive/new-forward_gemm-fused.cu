@@ -38,7 +38,7 @@ __constant__ int3 conv_lut[C_MAX * KERNEL_WIDTH * KERNEL_WIDTH];
 #define PADDED_TILE_WIDTH (TILE_WIDTH + KERNEL_WIDTH - 1)
 
 // Block size along the B (batch) dimension
-#define B_BATCH 8
+#define B_BATCH 2
 
 __global__ void conv_as_gemm(float* __restrict__ y,
                              const float* __restrict__ x,
@@ -54,10 +54,10 @@ __global__ void conv_as_gemm(float* __restrict__ y,
   const int W_out = W - K + 1;
 
   // Alias for height/width axis
-  const int t_hw = threadIdx.x, b_hw = blockDim.x;
+  const int t_hw = threadIdx.x;
   // Alias for output channels
-  const int t_m = threadIdx.y, b_m = blockDim.y;
-  const int m = blockIdx.y * b_m + t_m;
+  const int t_m = threadIdx.y;
+  const int m = blockIdx.y * blockDim.y + t_m;
   // Alias for batch axis
   const int t_b = threadIdx.z;
   const int b = blockIdx.z * blockDim.z + t_b;
@@ -84,30 +84,30 @@ __global__ void conv_as_gemm(float* __restrict__ y,
     (i_c) * (H * W) +        \
     (i_ih) * (W) +           \
     (i_iw)]
+  /*
 #define t2d(i, i_hw, i_ckk)                    \
   tile[(t_b) * (2 * TILE_WIDTH * TILE_WIDTH) + \
        (i) * (TILE_WIDTH * TILE_WIDTH) +       \
        (i_hw) * (TILE_WIDTH) +                 \
        (i_ckk)]
-  /*
-#define t2d(i_hw, i_m, i_ckk)                \
-  tile[(t_b) * ((b_hw + b_m) * TILE_WIDTH) + \
-       (i_hw + i_m) * (TILE_WIDTH) +         \
-       (i_ckk)]
   */
+#define t2d(i_hw, i_m, i_ckk)                            \
+  tile[(t_b) * ((blockDim.x + blockDim.y) * C * K * K) + \
+       (i_hw + i_m) * (C * K * K) +                      \
+       (i_ckk)]
 #define k1d(i_ckk)           \
   kernel[(m) * (C * K * K) + \
          (i_ckk)]
 
 #define t2d_xc(i_hw, i_ckk) \
-  t2d(0, i_hw, i_ckk)
+  t2d(i_hw, M, i_ckk)
 #define t2d_kt(i_m, i_ckk) \
-  t2d(1, i_m, i_ckk)
+  t2d(0, i_m, i_ckk)
 
   const int n_hw = H_out * W_out;
 
   // Identify the row/column of output element
-  const int dst_hw = blockIdx.x * b_hw + t_hw;
+  const int dst_hw = blockIdx.x * blockDim.x + t_hw;
   const int dst_x = dst_hw % W_out;
   const int dst_y = dst_hw / W_out;
 
@@ -116,34 +116,62 @@ __global__ void conv_as_gemm(float* __restrict__ y,
   const int n_tiles = (n_kernel + (TILE_WIDTH - 1)) / TILE_WIDTH;
 
   if ((b < B)) {
+    int dst_ckk;
+
+    /*
     float acc = 0;
     for (int n = 0; n < n_tiles; n++) {
       // Save sub-tile of xc and kernel to smem
-      for (int i_ckk = t_m; i_ckk < TILE_WIDTH; i_ckk += b_m) {
-        const int dst_ckk = n * TILE_WIDTH + i_ckk;
-        if ((dst_hw < n_hw) && (dst_ckk < n_kernel)) {
-          // Do input matrix unroll on-the-fly
-          int3 lut = conv_lut[dst_ckk];
-          const int q = lut.x, p = lut.y, c = lut.z;
-          t2d_xc(t_hw, i_ckk) = x3d(c, dst_y + p, dst_x + q);
-        } else {
-          t2d_xc(t_hw, i_ckk) = 0.0;
-        }
+      dst_ckk = n * blockDim.y + t_m;
+      if ((dst_hw < n_hw) && (dst_ckk < n_kernel)) {
+        // Do input matrix unroll on-the-fly
+        int3 lut = conv_lut[dst_ckk];
+        const int q = lut.x, p = lut.y, c = lut.z;
+        t2d_xc(t_m, t_hw) = x3d(c, dst_y + p, dst_x + q);
+      } else {
+        t2d_xc(t_m, t_hw) = 0.0;
       }
-
-      for (int i_ckk = t_hw; i_ckk < TILE_WIDTH; i_ckk += b_hw) {
-        const int dst_ckk = n * TILE_WIDTH + i_ckk;
-        if ((m < M) && (dst_ckk < n_kernel)) {
-          t2d_kt(t_m, i_ckk) = k1d(dst_ckk);
-        } else {
-          t2d_kt(t_m, i_ckk) = 0.0;
-        }
+      dst_ckk = n * blockDim.x + t_hw;
+      if ((m < M) && (dst_ckk < n_kernel)) {
+        t2d_kt(t_m, t_hw) = k1d(dst_ckk);
+      } else {
+        t2d_kt(t_m, t_hw) = 0.0;
       }
       __syncthreads();
 
       // C_ij = A_ik * B_kj ===> C_ij^T = B_kj^T * A_ik^t
       for (int k = 0; k < TILE_WIDTH; k++) {
-        acc += t2d_kt(t_m, k) * t2d_xc(t_hw, k);
+        acc += t2d_kt(t_m, k) * t2d_xc(k, t_hw);
+      }
+      __syncthreads();
+    }
+
+    if ((m < M) && (dst_hw < n_hw)) {
+      y1d(dst_hw) = acc;
+    }
+    */
+
+    float acc = 0;
+    for (int k = 0; k < C * K * K;) {
+      for (int i = 0; i < TILE_WIDTH; i++, k++) {
+        if (dst_hw < n_hw) {
+          // Do input matrix unroll on-the-fly
+          int3 lut = conv_lut[k];
+          const int q = lut.x, p = lut.y, c = lut.z;
+          t2d_xc(t_hw, i) = x3d(c, dst_y + p, dst_x + q);
+        } else {
+          t2d_xc(t_hw, i) = 0.0;
+        }
+        if (m < M) {
+          t2d_kt(t_m, i) = k1d(k);
+        } else {
+          t2d_kt(t_m, i) = 0.0;
+        }
+      }
+      __syncthreads();
+
+      for (int i = 0; i < TILE_WIDTH; i++) {
+        acc += t2d_kt(t_m, i) * t2d_xc(t_hw, i);
       }
       __syncthreads();
     }
@@ -175,12 +203,12 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
                                                     const int W,
                                                     const int K) {
   std::cout << "*** constant mem + tiled gemm" << std::endl;
-  printf("*** (B=%d, M=%d, C=%d, H=%d, W=%d, K=%d)\n", B, M, C, H, W, K);
+  printf("(B=%d, M=%d, C=%d, H=%d, W=%d, K=%d)\n", B, M, C, H, W, K);
 
   // Estimat output dimension
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
-  printf("*** (H_out=%d, W_out=%d)\n", H_out, W_out);
+  printf("(H_out=%d, W_out=%d)\n", H_out, W_out);
 
   // Calculate needed bytes for original input
   const size_t bytes_y = (B * M * H_out * W_out) * sizeof(float);
@@ -277,7 +305,7 @@ __host__ void GPUInterface::conv_forward_gpu(float* device_y,
 
   /*** Kernel call BEGIN ***/
   // Calculate launch size
-  dim3 block(TILE_WIDTH, 4, B_BATCH);
+  dim3 block(TILE_WIDTH, TILE_WIDTH / 2, B_BATCH);
   dim3 grid(ceil((float)H_out * W_out / block.x),
             ceil((float)M / block.y),
             ceil((float)B / block.z));
@@ -290,7 +318,7 @@ __host__ void GPUInterface::conv_forward_gpu(float* device_y,
       B_BATCH * 2 * PADDED_TILE_WIDTH * PADDED_TILE_WIDTH * sizeof(float);
   */
   size_t smem_size =
-      B_BATCH * (2 * TILE_WIDTH * TILE_WIDTH) * sizeof(float);
+      B_BATCH * ((block.x + block.y) * C * K * K) * sizeof(float);
   std::cout << "*** smem.size=" << smem_size / 1024 << "KiB" << std::endl;
 
 // Call the kernel

@@ -1,0 +1,39 @@
+C = gemm(A, B)
+
+x = (NHWC) -> BCHW
+w = (KRSC) -> MCKK
+y = (NPQK) -> BMHW
+
+  /*
+  Function paramter definitions:
+  y - output
+  x - input
+  k - kernel
+  B - batch_size (number of images in x)
+  M - number of output feature maps
+  C - number of input feature maps
+  H - input height dimension
+  W - input width dimension
+  K - kernel height and width (K x K)
+  */
+
+
+A = (NHW, RSC)
+B = (RSC, K)
+C = (NHW, K)
+
+y[n, p, q, k] = C_ij
+    - i = q + Q * (p + P * n)
+    - j = k
+
+    - k = j
+    - n = i / (PQ)
+      residual = i % (PQ)
+    - p = residual / Q
+    - q = residual % Q
+
+gemm_k = s + S * (r + R * c)
+    - c = gemm_k / (RS)
+      residual = gemm_k % (RS)
+    - r = residual / S
+    - s = residual % S
