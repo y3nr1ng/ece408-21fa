@@ -1,10 +1,7 @@
-#include <cuda_fp16.h>
-#include <mma.h>
 #include <cmath>
 #include <iostream>
+#include <mma.h>
 #include "gpu-new-forward.h"
-
-using namespace nvcuda;
 
 #define cudaErrChk(stmt) \
   { cudaAssert((stmt), __FILE__, __LINE__); }
@@ -22,175 +19,113 @@ inline void cudaAssert(cudaError_t error,
   }
 }
 
-// Stream configurations
-//#define USE_STREAM  // Use multi-stream to accelerate transfers
-#define N_STREAMS 16
+// Some feature flags
+//#define USE_STREAM // Use multi-stream to accelerate transfers
+//#define USE_ASYNC_ALLOCATOR // Use async allocators, available >= 11.2
 
 // Allocate maximal possible kernel size and reuse it between op1/2
 #define M_MAX 16
 #define C_MAX 4
 #define KERNEL_WIDTH 7
 __constant__ float kernel[M_MAX * C_MAX * KERNEL_WIDTH * KERNEL_WIDTH];
-__constant__ int3 conv_lut[C_MAX * KERNEL_WIDTH * KERNEL_WIDTH];
 
-// Tile configurations
+// The actual convolution kernel
 #define TILE_WIDTH 16
 #define PADDED_TILE_WIDTH (TILE_WIDTH + KERNEL_WIDTH - 1)
+__global__ void conv_forward_kernel(float* __restrict__ y,
+                                    const float* __restrict__ x,
+                                    const int B,
+                                    const int M,
+                                    const int C,
+                                    const int H,
+                                    const int W,
+                                    const int K) {
+  extern __shared__ float tile[];
 
-#define HW_TILE_WIDTH (TILE_WIDTH * (TILE_WIDTH / M_TILE_WIDTH))
-#define M_TILE_WIDTH 4
-#define CKK_TILE_WIDTH 64
-
-// Block size along the B (batch) dimension
-#define B_BATCH 1
-
-__global__ void conv_as_gemm(float* __restrict__ y,
-                             const float* __restrict__ x,
-                             const int B,
-                             const int M,
-                             const int C,
-                             const int H,
-                             const int W,
-                             const int K) {
-  //extern __shared__ float tile[];
+  /*
+  Function paramter definitions:
+  y - output
+  x - input
+  k - kernel
+  B - batch_size (number of images in x)
+  M - number of output feature maps
+  C - number of input feature maps
+  H - input height dimension
+  W - input width dimension
+  K - kernel height and width (K x K)
+  */
 
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
 
-  // Alias for height/width axis
-  const int t_hw = threadIdx.x, b_hw = blockDim.x;
-  // Alias for output channels
-  const int t_m = threadIdx.y, b_m = blockDim.y;
-  const int m = blockIdx.y * b_m + t_m;
+#define y2d(i1, i0) \
+  y[b * (M * H_out * W_out) + m * (H_out * W_out) + (i1) * (W_out) + i0]
+#define t3d(i2, i1, i0)                                   \
+  tile[tb * (C * PADDED_TILE_WIDTH * PADDED_TILE_WIDTH) + \
+       (i2) * (PADDED_TILE_WIDTH * PADDED_TILE_WIDTH) +   \
+       (i1) * (PADDED_TILE_WIDTH) + i0]
+#define x3d(i2, i1, i0) \
+  x[b * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+#define k3d(i2, i1, i0) \
+  kernel[m * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+
+  // Alias for block/thread index
+  const int bx = blockIdx.x, by = blockIdx.y;
+  const int tx = threadIdx.x, ty = threadIdx.y;
   // Alias for batch axis
-  const int t_b = threadIdx.z;
-  const int b = blockIdx.z * blockDim.z + t_b;
+  const int tb = threadIdx.z;
+  const int b = blockIdx.z * blockDim.z + tb;
 
-  // Y = (H W) * (K^2 C)
-  /*
-      c - input feature map
-  ho/wo - output height/width
-  hi/wi - input height/width
-  hk/wk - convolution loop height/width
-  */
+  int dst_x, dst_y, src_x, src_y;
 
-  /*
-   y.shape = (B, M, H_out, W_out)
-   t.shape = (b, 0/1, H_out, W_out, C, K, K)
-   k.shape = (M, C * K * K)
-  */
-#define y1d(i_hw)               \
-  y[(b) * (M * H_out * W_out) + \
-    (m) * (H_out * W_out) +     \
-    (i_hw)]
-#define x3d(i_c, i_ih, i_iw) \
-  x[(b) * (C * H * W) +      \
-    (i_c) * (H * W) +        \
-    (i_ih) * (W) +           \
-    (i_iw)]
-#define k1d(i_ckk)           \
-  kernel[(m) * (C * K * K) + \
-         (i_ckk)]
+  for (int m = 0; m < M; m++) {
+    // Pre-load to shared memory, need to loop multiple time, PW^2 / W^2
+    for (int c = 0; c < C; c++) {
+      for (int dst = ty * TILE_WIDTH + tx;
+           dst < PADDED_TILE_WIDTH * PADDED_TILE_WIDTH;
+           dst += TILE_WIDTH * TILE_WIDTH) {
+        // 3D index inside a padded tiles
+        dst_x = dst % PADDED_TILE_WIDTH;
+        dst_y = dst / PADDED_TILE_WIDTH;
+        // 3D index in global array, simply subtract the pad size
+        src_x = (bx * TILE_WIDTH + dst_x);
+        src_y = (by * TILE_WIDTH + dst_y);
 
-  /*
-#define t2d(i, i_hw, i_ckk)                    \
-  tile[(t_b) * (2 * TILE_WIDTH * TILE_WIDTH) + \
-       (i) * (TILE_WIDTH * TILE_WIDTH) +       \
-       (i_hw) * (TILE_WIDTH) +                 \
-       (i_ckk)]
-#define t2d_xc(i_ckk, i_hw) \
-  t2d(0, i_ckk, i_hw)
-#define t2d_kt(i_m, i_ckk) \
-  t2d(1, i_m, i_ckk)
-  */
-
-  __shared__ float tile_xc[B_BATCH][TILE_WIDTH][TILE_WIDTH+1];
-  __shared__ float tile_kt[B_BATCH][TILE_WIDTH][TILE_WIDTH+1];
-
-#define t2d_xc(i_ckk, i_hw) \
-  tile_xc[t_b][i_ckk][i_hw]
-#define t2d_kt(i_m, i_ckk) \
-  tile_kt[t_b][i_m][i_ckk]
-
-  const int n_hw = H_out * W_out;
-
-  // Identify the row/column of output element
-  const int dst_hw = blockIdx.x * b_hw + t_hw;
-  const int dst_x = dst_hw % W_out;
-  const int dst_y = dst_hw / W_out;
-
-  // Calculate number of subtiles
-  const int n_kernel = C * K * K;
-  const int n_tiles = (n_kernel + (TILE_WIDTH - 1)) / TILE_WIDTH;
-
-  if ((b < B)) {
-    float acc = 0;
-    int dst_ckk;
-    for (int n = 0; n < n_tiles; n++) {
-
-      // Save sub-tile of xc and kernel to smem
-      for (int i_ckk = t_m; i_ckk < TILE_WIDTH; i_ckk += b_m) {
-        const int dst_ckk = n * TILE_WIDTH + i_ckk;
-        if ((dst_hw < n_hw) && (dst_ckk < n_kernel)) {
-          // Do input matrix unroll on-the-fly
-          int3 lut = conv_lut[dst_ckk];
-          const int q = lut.x, p = lut.y, c = lut.z;
-          t2d_xc(i_ckk, t_hw) = x3d(c, dst_y + p, dst_x + q);
+        if ((src_x < W) && (src_y < H)) {
+          t3d(c, dst_y, dst_x) = x3d(c, src_y, src_x);
         } else {
-          t2d_xc(i_ckk, t_hw) = 0.0;
+          t3d(c, dst_y, dst_x) = 0.0f;
         }
       }
+    }
+    __syncthreads();
 
-      for (int i_ckk = t_hw; i_ckk < TILE_WIDTH; i_ckk += b_hw) {
-        const int dst_ckk = n * TILE_WIDTH + i_ckk;
-        if ((m < M) && (dst_ckk < n_kernel)) {
-          t2d_kt(t_m, i_ckk) = k1d(dst_ckk);
-        } else {
-          t2d_kt(t_m, i_ckk) = 0.0;
-        }
-      }
-
-      /*
-      dst_ckk = n * TILE_WIDTH + t_m;
-      if ((dst_hw < n_hw) && (dst_ckk < n_kernel)) {
-        // Do input matrix unroll on-the-fly
-        int3 lut = conv_lut[dst_ckk];
-        const int q = lut.x, p = lut.y, c = lut.z;
-        t2d_xc(t_m, t_hw) = x3d(c, dst_y + p, dst_x + q);
-      } else {
-        t2d_xc(t_m, t_hw) = 0.0;
-      }
-
-      dst_ckk = n * TILE_WIDTH + t_hw;
-      if ((m < M) && (dst_ckk < n_kernel)) {
-        t2d_kt(t_m, t_hw) = k1d(dst_ckk);
-      } else {
-        t2d_kt(t_m, t_hw) = 0.0;
-      }
-      */
-
-      __syncthreads();
-
-      // C_ij = A_ik * B_kj ===> C_ij^T = B_kj^T * A_ik^t
+    // the actual convolution
+    float sum = 0;
+    for (int c = 0; c < C; c++) {
 #pragma unroll
-      for (int k = 0; k < TILE_WIDTH; k++) {
-        acc += t2d_kt(t_m, k) * t2d_xc(k, t_hw);
+      for (int p = 0; p < KERNEL_WIDTH; p++) {
+#pragma unroll
+        for (int q = 0; q < KERNEL_WIDTH; q++) {
+          sum += t3d(c, ty + p, tx + q) * k3d(c, p, q);
+        }
       }
-      __syncthreads();
     }
 
-    if ((m < M) && (dst_hw < n_hw)) {
-      y1d(dst_hw) = acc;
+    // update the destination 3D index
+    dst_x = bx * TILE_WIDTH + tx;
+    dst_y = by * TILE_WIDTH + ty;
+    // restore the linear index in global scope
+    if ((dst_x < W_out) && (dst_y < H_out)) {
+      y2d(dst_y, dst_x) = sum;
     }
+    __syncthreads();
   }
 
-#undef t2d_xc
-#undef t2d_kt
-
-#undef y1d
+#undef y2d
+#undef t3d
 #undef x3d
-#undef t2d
-#undef k1d
+#undef k3d
 }
 
 __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
@@ -205,20 +140,27 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
                                                     const int H,
                                                     const int W,
                                                     const int K) {
-  std::cout << "*** constant mem + tiled gemm" << std::endl;
-  printf("*** (B=%d, M=%d, C=%d, H=%d, W=%d, K=%d)\n", B, M, C, H, W, K);
+  std::cout << "*** constant mem + tiled + restrict/unroll + stream ***" << std::endl;
+
+  printf("(B=%d, M=%d, C=%d, H=%d, W=%d, K=%d)\n", B, M, C, H, W, K);
 
   // Estimat output dimension
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
-  printf("*** (H_out=%d, W_out=%d)\n", H_out, W_out);
 
-  // Calculate needed bytes for original input
+  // Calculate needed bytes
   const size_t bytes_y = (B * M * H_out * W_out) * sizeof(float);
   const size_t bytes_x = (B * C * H * W) * sizeof(float);
   const size_t bytes_k = (M * C * K * K) * sizeof(float);
 
-#ifdef USE_STREAM
+#ifndef USE_STREAM
+  // Allocate memory on device
+  cudaErrChk(cudaMalloc(device_y_ptr, bytes_y));
+  cudaErrChk(cudaMalloc(device_x_ptr, bytes_x));
+
+  // Copy input data to device
+  cudaErrChk(cudaMemcpy(*device_x_ptr, host_x, bytes_x, cudaMemcpyHostToDevice));
+#else
   // Pass through host pointers
   *device_y_ptr = (float*)host_y;
   *device_x_ptr = (float*)host_x;
@@ -226,29 +168,10 @@ __host__ void GPUInterface::conv_forward_gpu_prolog(const float* host_y,
   // Mark them as pinned memory for asynchronous transfer
   cudaErrChk(cudaHostRegister(*device_y_ptr, bytes_y, cudaHostRegisterPortable));
   cudaErrChk(cudaHostRegister(*device_x_ptr, bytes_x, cudaHostRegisterPortable));
-#else
-  // Allocate memory on device
-  cudaErrChk(cudaMalloc(device_y_ptr, bytes_y));
-  cudaErrChk(cudaMalloc(device_x_ptr, bytes_x));
-
-  // Copy input data to device
-  cudaErrChk(cudaMemcpy(*device_x_ptr, host_x, bytes_x, cudaMemcpyHostToDevice));
 #endif
 
   // Copy kernel weights
   cudaErrChk(cudaMemcpyToSymbol(kernel, host_k, bytes_k));
-
-  // Calculate lookup table
-  int3 host_conv_lut[C * K * K];
-  for (int i = 0, c = 0; c < C; c++) {
-    for (int p = 0; p < K; p++) {
-      for (int q = 0; q < K; q++, i++) {
-        host_conv_lut[i] = make_int3(q, p, c);
-      }
-    }
-  }
-  const size_t bytes_conv_lut = (C * K * K) * sizeof(int3);
-  cudaErrChk(cudaMemcpyToSymbol(conv_lut, host_conv_lut, bytes_conv_lut));
 }
 
 __host__ void GPUInterface::conv_forward_gpu(float* device_y,
@@ -264,11 +187,18 @@ __host__ void GPUInterface::conv_forward_gpu(float* device_y,
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
 
-/*** Prolog BEGIN ***/
-#ifdef USE_STREAM
+  // Block size along the B (batch) dimension
+  const int B_batch_size = 4;
+
+  /*** Prolog BEGIN ***/
+#ifndef USE_STREAM
+  // Send the entire batch
+  const int B = B0;
+#else // USE_STREAM
   // Create streams
-  cudaStream_t stream[N_STREAMS];
-  for (int i = 0; i < N_STREAMS; i++) {
+  const int n_streams = 16;
+  cudaStream_t stream[n_streams];
+  for (int i = 0; i < n_streams; i++) {
     cudaErrChk(cudaStreamCreateWithFlags(&stream[i], cudaStreamNonBlocking));
   }
 
@@ -282,15 +212,16 @@ __host__ void GPUInterface::conv_forward_gpu(float* device_y,
   const size_t bytes_y = n_y * sizeof(float);
   const size_t bytes_x = n_x * sizeof(float);
   // Calculate partial elements and bytes per stream
-  const int B = ceil((float)B0 / N_STREAMS);
+  const int B = ceil((float)B0 / n_streams);
   const int n_y_stream = B * M * H_out * W_out;
   const int n_x_stream = B * C * H * W;
 
+#ifndef USE_ASYNC_ALLOCATOR
   cudaErrChk(cudaMalloc(&device_y, bytes_y));
   cudaErrChk(cudaMalloc(&device_x, bytes_x));
 
   // Copy over the relevant data structures to the GPU
-  for (int i = 0; i < N_STREAMS; i++) {
+  for (int i = 0; i < n_streams; i++) {
     size_t offset = i * n_x_stream;
     size_t bytes = n_x_stream * sizeof(float);
     if (offset + n_x_stream > n_x) {
@@ -300,72 +231,107 @@ __host__ void GPUInterface::conv_forward_gpu(float* device_y,
     cudaErrChk(cudaMemcpyAsync((void*)&device_x[offset], (void*)&host_x[offset], bytes,
                                cudaMemcpyHostToDevice, stream[i]));
   }
-#else   // USE_STREAM
-  // Send the entire batch
-  const int B = B0;
-#endif  // USE_STREAM
-  /*** Prolog END ***/
+#else // USE_ASYNC_ALLOCATOR
+  // Allocate memory input segments of each stream
+  float* device_y_stream[n_streams];
+  float* device_x_stream[n_streams];
+  for (int i = 0; i < n_streams; i++) {
+    size_t offset = i * n_x_stream;
+    size_t bytes = n_x_stream * sizeof(float);
+    if (offset + n_x_stream > n_x) {
+      // Last stream does not need to copy that much
+      bytes = (n_x - offset) * sizeof(float);
+    }
+    cudaErrChk(cudaMallocAsync(&device_x_stream[i], bytes, stream[i]));
 
-  /*** Kernel call BEGIN ***/
-  // Calculate launch size
-  //dim3 block(TILE_WIDTH * 4, TILE_WIDTH / 2, B_BATCH);
-  dim3 block(TILE_WIDTH, TILE_WIDTH, B_BATCH);
-  dim3 grid(ceil((float)H_out * W_out / block.x),
-            ceil((float)M / block.y),
-            ceil((float)B / block.z));
-  printf("*** grid=(x=%d, y=%d, z=%d), block=(x=%d, y=%d, z=%d)\n",
-         grid.x, grid.y, grid.z, block.x, block.y, block.z);
-
-  // Determine shared memory size
-  /*
-  size_t smem_size =
-      B_BATCH * 2 * PADDED_TILE_WIDTH * PADDED_TILE_WIDTH * sizeof(float);
-  */
-  size_t smem_size =
-      B_BATCH * (2 * TILE_WIDTH * TILE_WIDTH) * sizeof(float);
-  std::cout << "*** smem.size=" << smem_size / 1024 << "KiB" << std::endl;
-  smem_size = 0;  // DEBUG
-
-// Call the kernel
-#ifdef USE_STREAM
-  for (int i = 0; i < N_STREAMS; i++) {
-    size_t offset_y = i * n_y_stream;
-    size_t offset_x = i * n_x_stream;
-    conv_as_gemm<<<grid, block, smem_size, stream[i]>>>(
-        &device_y[offset_y], &device_x[offset_x],
-        B, M, C, H, W, K);
+    // Copy over that chunk from host
+    cudaErrChk(cudaMemcpyAsync(&device_x_stream[i], &host_x[offset], bytes,
+                               cudaMemcpyHostToDevice, stream[i]));
   }
-#else   // USE_STREAM
-  conv_as_gemm<<<grid, block, smem_size>>>(device_y, device_x,
-                                           B, M, C, H, W, K);
-#endif  // USE_STREAM
-  /*** Kernel call END ***/
 
-  /*** Epilog BEGIN ***/
-#ifdef USE_STREAM
-  // Copy back data to host
-  for (int i = 0; i < N_STREAMS; i++) {
+  // Allocate memory for output segments
+  for (int i = 0; i < n_streams; i++) {
     size_t offset = i * n_y_stream;
     size_t bytes = n_y_stream * sizeof(float);
     if (offset + n_y_stream > n_y) {
       // Last stream does not need to copy that much
       bytes = (n_y - offset) * sizeof(float);
     }
-    cudaErrChk(cudaMemcpyAsync(&host_y[offset], &device_y[offset], bytes,
-                               cudaMemcpyDeviceToHost, stream[i]));
+    cudaErrChk(cudaMallocAsync(&device_y_stream[i], bytes, stream[i]));
   }
+#endif // USE_ASYNC_ALLOCATOR
+#endif // USE_STREAM
+  /*** Prolog END ***/
 
-  // Destory streams
-  for (int i = 0; i < N_STREAMS; i++) {
-    cudaErrChk(cudaStreamDestroy(stream[i]));
+
+  /*** Kernel call BEGIN ***/
+  // Calculate launch size
+  dim3 block(TILE_WIDTH, TILE_WIDTH, B_batch_size);
+  dim3 grid(ceil((float)W_out / block.x),
+            ceil((float)H_out / block.y),
+            ceil((float)B / block.z));
+  printf("grid=(x=%d, y=%d, z=%d), block=(x=%d, y=%d, z=%d)\n",
+         grid.x, grid.y, grid.z, block.x, block.y, block.z);
+
+  // Determine shared memory size
+  size_t smem_size =
+      B_batch_size * C * PADDED_TILE_WIDTH * PADDED_TILE_WIDTH * sizeof(float);
+
+  // Call the kernel
+#ifndef USE_STREAM
+  conv_forward_kernel<<<grid, block, smem_size>>>(device_y, device_x, B, M, C, H, W, K);
+  cudaErrChk(cudaDeviceSynchronize());
+#else // USE_STREAM
+  for (int i = 0; i < n_streams; i++) {
+#ifndef USE_ASYNC_ALLOCATOR
+    size_t offset_y = i * n_y_stream;
+    size_t offset_x = i * n_x_stream;
+    conv_forward_kernel<<<grid, block, smem_size, stream[i]>>>(
+        &device_y[offset_y], &device_x[offset_x], B, M, C, H, W, K);
+#else // USE_ASYNC_ALLOCATOR
+    conv_forward_kernel<<<grid, block, smem_size, stream[i]>>>(
+        device_y_stream[i], device_x_stream[i], B, M, C, H, W, K);
+#endif // USE_ASYNC_ALLOCATOR
   }
-#else   // USE_STREAM
-  // nop
-#endif  // USE_STREAM
-  /*** Epilog END ***/
+#endif // USE_STREAM
+  /*** Kernel call END ***/
 
+
+  /*** Epilog BEGIN ***/
+#ifndef USE_STREAM
   // We directly wait for the single kernel to end
   cudaErrChk(cudaDeviceSynchronize());
+#else
+  // Copy back data to host
+  for (int i = 0; i < n_streams; i++) {
+    size_t offset = i * n_y_stream;
+    size_t bytes = n_y_stream * sizeof(float);
+    if (offset + n_y_stream > n_y) {
+      // Last stream does not need to copy that much
+      bytes = (n_y - offset) * sizeof(float);
+    }
+#ifndef USE_ASYNC_ALLOCATOR
+    cudaErrChk(cudaMemcpyAsync(&host_y[offset], &device_y[offset], bytes,
+                               cudaMemcpyDeviceToHost, stream[i]));
+#else // USE_ASYNC_ALLOCATOR
+    cudaErrChk(cudaMemcpyAsync(&host_y[offset], device_y_stream[i], bytes,
+                               cudaMemcpyDeviceToHost, stream[i]));
+
+    // Free segments for current stream
+    cudaErrChk(cudaFreeAsync(device_y_stream[i], stream[i]));
+    cudaErrChk(cudaFreeAsync(device_x_stream[i], stream[i]));
+#endif // USE_ASYNC_ALLOCATOR
+  }
+
+  // Need to wait every stream to finish before destory all streams
+  cudaErrChk(cudaDeviceSynchronize());
+
+  // Destory streams
+  for (int i = 0; i < n_streams; i++) {
+    cudaErrChk(cudaStreamDestroy(stream[i]));
+  }
+#endif
+  /*** Epilog END ***/
 }
 
 __host__ void GPUInterface::conv_forward_gpu_epilog(float* host_y,
@@ -378,13 +344,7 @@ __host__ void GPUInterface::conv_forward_gpu_epilog(float* host_y,
                                                     const int H,
                                                     const int W,
                                                     const int K) {
-#ifdef USE_STREAM
-  // Data is already write back to host earlier, safe to clean up now
-
-  // Release pinned memory
-  cudaErrChk(cudaHostUnregister(device_y));
-  cudaErrChk(cudaHostUnregister(device_x));
-#else   // USE_STREAM
+#ifndef USE_STREAM
   const int H_out = H - K + 1;
   const int W_out = W - K + 1;
   const size_t bytes_y = (B * M * H_out * W_out) * sizeof(float);
@@ -395,7 +355,13 @@ __host__ void GPUInterface::conv_forward_gpu_epilog(float* host_y,
   // Free device memory
   cudaErrChk(cudaFree(device_y));
   cudaErrChk(cudaFree(device_x));
-#endif  // USE_STREAM
+#else
+  // Data is already write back to host earlier, safe to clean up now
+
+  // Release pinned memory
+  cudaErrChk(cudaHostUnregister(device_y));
+  cudaErrChk(cudaHostUnregister(device_x));
+#endif
 }
 
 __host__ void GPUInterface::get_device_properties() {
